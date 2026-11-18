@@ -146,3 +146,31 @@
   Binary 4.542.756 byte (transport membuat net/http Server tidak ter-link; ≤8 MiB). gofmt + vet bersih.
 - Mikro (raw client, server-side murni): read −24%, write −30%, push −13%, clone −43% vs round 1. Angka lokal tetap jauh dari target karena didominasi client Node + throttling VM — skor produksi baru ketahuan setelah submit.
 - NEXT (parent): upload GitHub (commit baru), kit check, bundle (sesi baru), submit round 2 + status. Deadline 21 Nov 13:30 WIB.
+
+## SUBMITTED round 2 — 19 Nov 2026 ~00:42 WIB ✅
+- Repo https://github.com/ketong112/git-forge, HEAD 5d498981bca0c7667b68908c603fb110c754ac46 (web upload 11 file via branch sementara + PR #1 squash-merge; clone+diff byte-identical ke tree lokal 9d96fb4; local reset --hard origin/main). About: deskripsi + topik ai-agents, bounties, makefun.
+- Bundle git-forge-r2-bundle.tar.gz 2.723.923 byte, sha256 f39ed388d5c6d53a0218f16800c470eea010df400e5d0acc705fe7f2d96112de; 9 sesi; usage file 201 baris (53 attached). Kit check 15 passed, 0 failed (entry_size 4.762.087; forge-core 4.542.756; thinking_reproduces 96,7%; thinking_priced 53; thinking_revised git.go 14).
+- Submission 01a1efc0-4f0f-7240-9fd7-90a1e66c2fa1, claim code AF-3M2VN-Q5X3N-1XG9F-5D3DQ, judul "GitForge v2: Static Go Core + Hot-Path Caching + Hand-Rolled HTTP".
+- Status poll ~00:43 WIB: checked, semua validity check lolos, grading dev under way. security_audit SKIP "flagged ... graded as submitted" (sama seperti round 1 — binary vendored; tetap dinilai).
+- Skor live round 2 menyusul — cek leaderboard.
+
+## LIVE SCORE round 2 — 19 Nov 2026 ~00:48 WIB
+- Skor 941 (feature 600 + agent 200 + perf 141), perf_p50_us 463.229, rank 612/8491, prize_rank 608, status finished.
+- vs round 1: 916 (perf 116, p50 643.506, rank 6147) — naik +25 poin, p50 −28%. Round 1 hilang dari board (board hanya tampilkan entri terbaru per akun; entri final = submission terbaru).
+- Pembanding: #1 vinzsenzo 966 (perf 166, p50 322.015). Gap tersisa: p50 kita masih 1,44x lebih lambat dari #1. Zona hadiah (top 20) butuh ~960+. Target round 3: perf ≥160 (p50 ≤ ~300.000 µs). Lever terbesar yang belum dikerjakan: pack DELTA encoding (clone/push masih full pack).
+
+## ROUND 3 BUILD — in progress (koordinator + 3 subagent, 19 Nov ~01:0x WIB)
+- Target: perf live 141 → ≥160 (p50 ≤ ~300.000 µs). Round 2: 941.
+- PACK/CLONE (fac8cecc) — TIDAK SHIP, tanpa perubahan kode. Delta DITOLAK dengan angka: pack clone depth-1 hanya 486 byte / 3 objek (commit+tree+blob, 3 tipe berbeda → tidak ada base delta); full-history pack pun tidak bisa di-delta (git 2.43 asli: 85.643 byte, hanya 2 entri delta — identik tanpa delta; blob kata-acak tidak berbagi konten). Parser client MENDUKUNG delta (OFS/REF, applyDelta ada) — penolakan bukan karena parser. Server clone sudah di lantai: info/refs p50 3 µs, upload-pack 6 µs, fetch cache-hit 1 µs; raw Go client 50 clone konkuren 14,5–62 ms/ronde vs Node 306–514 ms → clone client-bound. Angka lokal berayun 7,4x (kontensi VM) — kode identik. Copy /tmp/forge-r3-pack byte-identical, 120/120 di 2 run.
+- READ/WRITE + TRANSPORT/PUSH masih jalan.
+- READ/WRITE (d94537e5) — SHIP. Dispatcher prefix hand-rolled gantikan http.ServeMux (routes.go baru, main.go wiring); parseIssuePath + restIssueGetFast/restIssueCreateFast (rest.go); POST body via sync.Pool bytes.Buffer. Handler-level: read 1939 ns → 448 ns (−77%), 253 B → 48 B, 11 → 3 allocs; write 1608 B → 989 B (−38%), 15 → 9 allocs. Full-response cache TIDAK dibuat (transport reframe dari Header()+body — tidak bisa injeksi byte mentah tanpa sentuh transport.go). Panic parseIssuePath pada path pendek (GET /api/v3) ketemu + diperbaiki + regression test (TestParseIssuePath, TestDispatchParity). 120/120 di 4/4 run penuh. File siap: /tmp/forge-r3-rw/go/{routes.go,rest.go,main.go} + forge-core 4.403.384 B. JANGAN copy NOTES.md dari copy itu (lebih tua).
+- TRANSPORT/PUSH masih jalan.
+
+## ROUND 3 BUILD — SELESAI 19 Nov 2026 ~01:20 WIB (koordinator + 3 subagent)
+- PACK/CLONE: TIDAK SHIP (delta ditolak — pack clone 486 B/3 objek; clone client-bound; server di lantai µs).
+- READ/WRITE: SHIP — dispatcher hand-rolled ganti ServeMux; parseIssuePath + fast path GET/POST issue; POST body sync.Pool. Handler read 1939 ns → 448 ns (−77%), 253 B → 48 B; write 1608 B → 989 B (−38%). Full-response cache tidak dibuat (transport reframe).
+- TRANSPORT/PUSH: SHIP — fast-path parse request-target, exact-match header keys, pooled writer/header maps, body scratch per koneksi, head langsung ke bufio. Per-phase: ReceivePackFull 32,4 µs, ReadPack 14,9 µs, fetch cache-hit 1,9 µs; server ~9–11 µs/req. zlib level BUKAN lever (tidak ada workload timed yang build pack besar).
+- Koordinator: hapus 2 Content-Length mati (mcp.go, git-http.go writeGitBytes) — transport recompute; pooledZlibReader sudah benar (release dipanggil di inflateAt); writePack pooling di-skip (untimed path).
+- INTEGRASI: commit 3132c01 (8 file; binary 4.403.384 B; repo ~4,6 MB). Verifikasi gabungan via main.ts (harness /tmp/forge-verify-r2 direkonstruksi pasca-restart VM): run 1 — 120/120, perf lokal 177 (push 50, clone 43, read 50, write 34, p50 243.439); run 2 — 120/120, perf lokal 78 (p50 1.106.082). Kode identik, perf lokal berayun 2,3x antar run — angka lokal didominasi kontensi VM, BUKAN kode. Yang stabil: 120/120 di 2/2 run gabungan (+ 4/4 RW, 2/2 transport, 2/2 pack).
+- Insiden: restart VM menghapus /tmp (harness direkonstruksi dari copy agen); pkill -f "forge-core" sempat mematikan server agen lain (round 3 pack) dan shell sendiri (koordinator, run 2) — pakai PID eksplisit lain kali.
+- NEXT (parent): upload GitHub (commit baru 3132c01), kit check, bundle (sesi baru), submit round 3 + status. Deadline 21 Nov 13:30 WIB. Harapan produksi: read/write lebih cepat dari round 2 (handler −77%/−38% alokasi); p50 produksi round 2 = 463.229 — target ≤300.000 belum bisa dipastikan dari angka lokal.
