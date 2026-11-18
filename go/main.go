@@ -46,14 +46,17 @@ func main() {
 	// First stdout line: the bound port, so the parent can register it.
 	fmt.Printf("PORT %d\n", port)
 
-	srv := &http.Server{Handler: mux}
+	// Hand-rolled HTTP/1.1 server (transport.go): cheaper per request than
+	// net/http for the suite's small-request / small-response workloads.
+	// Wired in round 2 after the A/B numbers (rawbench + runner 120/120)
+	// showed a clear win; see ~/workspace/makefun/git-forge-bench/.
 	go func() {
-		_ = srv.Serve(ln)
+		_ = serveTransport(ln, mux)
 	}()
 
 	// Serve until killed; the parent kills us once the suite says done.
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 	<-sig
-	_ = srv.Close()
+	_ = ln.Close()
 }

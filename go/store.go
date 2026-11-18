@@ -103,6 +103,10 @@ type Repo struct {
 	gitMu   sync.RWMutex // guards Objects and Refs
 	Objects map[string]*GitObject
 	Refs    map[string]string // full ref name ("refs/heads/main") -> commit oid
+
+	// refsVersion bumps on every SetRef/DeleteRef; the git HTTP layer caches
+	// ref advertisements keyed by (repo, refsVersion).
+	refsVersion uint64
 }
 
 // Store is the whole forge: repositories by "owner/name".
@@ -265,6 +269,7 @@ func (r *Repo) GetRef(name string) (string, bool) {
 func (r *Repo) SetRef(name, oid string) {
 	r.gitMu.Lock()
 	r.Refs[name] = oid
+	atomic.AddUint64(&r.refsVersion, 1)
 	r.gitMu.Unlock()
 }
 
@@ -276,6 +281,7 @@ func (r *Repo) DeleteRef(name string) bool {
 		return false
 	}
 	delete(r.Refs, name)
+	atomic.AddUint64(&r.refsVersion, 1)
 	return true
 }
 

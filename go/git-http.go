@@ -8,13 +8,13 @@ package main
 
 import (
 	"bytes"
-	"encoding/hex"
 	"io"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 const gitAgent = "forge-core/1.0"
@@ -69,6 +69,34 @@ func gitHandler(w http.ResponseWriter, r *http.Request, store *Store) {
 
 // ---------------------------------------------------------------- info/refs
 
+// infoRefsCache memoises ref advertisements: the bytes are a pure function of
+// (repo, refsVersion) for a given service/variant, and refs only change via
+// SetRef/DeleteRef (which bump refsVersion). Keyed by a string the builders
+// below construct; values are immutable response bodies, served as one Write.
+var infoRefsCache sync.Map // string -> []byte
+
+func refsVersionOf(repo *Repo) uint64 {
+	return atomic.LoadUint64(&repo.refsVersion)
+}
+
+func infoRefsKey(repo *Repo, variant string) string {
+	return variant + "|" + strconv.FormatInt(repo.ID, 10) + "|" + strconv.FormatUint(refsVersionOf(repo), 10)
+}
+
+// uploadPackV2Ad is the v2 upload-pack advertisement: it names no refs, so it
+// is identical for every repository and is built once.
+var uploadPackV2Ad = func() []byte {
+	buf := make([]byte, 0, 128)
+	buf = appendPktLine(buf, []byte("# service=git-upload-pack\n"))
+	buf = appendPktLine(buf, []byte("version 2\n"))
+	buf = appendPktLine(buf, []byte("agent="+gitAgent+"\n"))
+	buf = appendPktLine(buf, []byte("ls-refs=unborn\n"))
+	buf = appendPktLine(buf, []byte("fetch=shallow\n"))
+	buf = appendPktLine(buf, []byte("object-format=sha1\n"))
+	buf = appendPktLine(buf, nil)
+	return buf
+}()
+
 // sortedRefs returns refs sorted by name (refs/heads/*, refs/tags/*, ...).
 func sortedRefs(refs map[string]string) []string {
 	names := make([]string, 0, len(refs))
@@ -90,24 +118,21 @@ func refCapabilities(service string) string {
 // gitInfoRefsUpload answers the upload-pack advertisement, v2 when the client
 // asks (Git-Protocol: version=2), else v0.
 func gitInfoRefsUpload(w http.ResponseWriter, r *http.Request, repo *Repo) {
-	refs := repo.ListRefs()
 	if r.Header.Get("Git-Protocol") == "version=2" {
-		var buf bytes.Buffer
-		buf.Write(pktLine([]byte("# service=git-upload-pack\n")))
-		buf.Write(pktLine([]byte("version 2\n")))
-		buf.Write(pktLine([]byte("agent=" + gitAgent + "\n")))
-		buf.Write(pktLine([]byte("ls-refs=unborn\n")))
-		buf.Write(pktLine([]byte("fetch=shallow\n")))
-		buf.Write(pktLine([]byte("object-format=sha1\n")))
-		buf.Write(pktLine(nil))
-		writeGitBytes(w, "application/x-git-upload-pack-advertisement", buf.Bytes())
+		// The v2 advertisement names no refs: one precomputed body.
+		writeGitBytes(w, "application/x-git-upload-pack-advertisement", uploadPackV2Ad)
 		return
 	}
-	var buf bytes.Buffer
-	buf.Write(pktLine([]byte("# service=git-upload-pack\n")))
+	if cached, ok := infoRefsCache.Load(infoRefsKey(repo, "up0")); ok {
+		writeGitBytes(w, "application/x-git-upload-pack-advertisement", cached.([]byte))
+		return
+	}
+	refs := repo.ListRefs()
+	buf := make([]byte, 0, 256)
+	buf = appendPktLine(buf, []byte("# service=git-upload-pack\n"))
 	names := sortedRefs(refs)
 	if len(names) == 0 {
-		buf.Write(pktLine([]byte(zeroOID + " capabilities^{}\x00" + refCapabilities("upload-pack") + "\n")))
+		buf = appendPktLine(buf, []byte(zeroOID+" capabilities^{}\x00"+refCapabilities("upload-pack")+"\n"))
 	} else {
 		for i, name := range names {
 			line := refs[name] + " " + name
@@ -115,24 +140,29 @@ func gitInfoRefsUpload(w http.ResponseWriter, r *http.Request, repo *Repo) {
 				line += "\x00" + refCapabilities("upload-pack")
 			}
 			line += "\n"
-			buf.Write(pktLine([]byte(line)))
+			buf = appendPktLine(buf, []byte(line))
 			if peeled := peeledOID(repo, name, refs[name]); peeled != "" {
-				buf.Write(pktLine([]byte(peeled + " " + name + "^{}\n")))
+				buf = appendPktLine(buf, []byte(peeled+" "+name+"^{}\n"))
 			}
 		}
 	}
-	buf.Write(pktLine(nil))
-	writeGitBytes(w, "application/x-git-upload-pack-advertisement", buf.Bytes())
+	buf = appendPktLine(buf, nil)
+	infoRefsCache.Store(infoRefsKey(repo, "up0"), buf)
+	writeGitBytes(w, "application/x-git-upload-pack-advertisement", buf)
 }
 
 // gitInfoRefsReceive answers the receive-pack advertisement (always v0).
 func gitInfoRefsReceive(w http.ResponseWriter, r *http.Request, repo *Repo) {
+	if cached, ok := infoRefsCache.Load(infoRefsKey(repo, "recv")); ok {
+		writeGitBytes(w, "application/x-git-receive-pack-advertisement", cached.([]byte))
+		return
+	}
 	refs := repo.ListRefs()
-	var buf bytes.Buffer
-	buf.Write(pktLine([]byte("# service=git-receive-pack\n")))
+	buf := make([]byte, 0, 256)
+	buf = appendPktLine(buf, []byte("# service=git-receive-pack\n"))
 	names := sortedRefs(refs)
 	if len(names) == 0 {
-		buf.Write(pktLine([]byte(zeroOID + " capabilities^{}\x00" + refCapabilities("receive-pack") + "\n")))
+		buf = appendPktLine(buf, []byte(zeroOID+" capabilities^{}\x00"+refCapabilities("receive-pack")+"\n"))
 	} else {
 		for i, name := range names {
 			line := refs[name] + " " + name
@@ -140,14 +170,15 @@ func gitInfoRefsReceive(w http.ResponseWriter, r *http.Request, repo *Repo) {
 				line += "\x00" + refCapabilities("receive-pack")
 			}
 			line += "\n"
-			buf.Write(pktLine([]byte(line)))
+			buf = appendPktLine(buf, []byte(line))
 			if peeled := peeledOID(repo, name, refs[name]); peeled != "" {
-				buf.Write(pktLine([]byte(peeled + " " + name + "^{}\n")))
+				buf = appendPktLine(buf, []byte(peeled+" "+name+"^{}\n"))
 			}
 		}
 	}
-	buf.Write(pktLine(nil))
-	writeGitBytes(w, "application/x-git-receive-pack-advertisement", buf.Bytes())
+	buf = appendPktLine(buf, nil)
+	infoRefsCache.Store(infoRefsKey(repo, "recv"), buf)
+	writeGitBytes(w, "application/x-git-receive-pack-advertisement", buf)
 }
 
 // peeledOID returns the commit a tag ref peels to, "" when not an annotated tag.
@@ -213,7 +244,8 @@ func gitUploadPackV2(w http.ResponseWriter, repo *Repo, body []byte) {
 	}
 	// Lines are: command=..., [agent=...,] [object-format=...,] delim,
 	// then the arguments, then flush. The delim arrives as an empty
-	// non-nil payload.
+	// non-nil payload. Arguments are compared as bytes; only the command
+	// value and the argument strings are materialised.
 	command := ""
 	var args []string
 	seenDelim := false
@@ -225,14 +257,14 @@ func gitUploadPackV2(w http.ResponseWriter, repo *Repo, body []byte) {
 			seenDelim = true
 			continue
 		}
-		text := strings.TrimSuffix(string(line), "\n")
+		text := bytes.TrimSuffix(line, []byte("\n"))
 		if !seenDelim {
-			if strings.HasPrefix(text, "command=") {
-				command = strings.TrimPrefix(text, "command=")
+			if bytes.HasPrefix(text, []byte("command=")) {
+				command = string(text[len("command="):])
 			}
 			continue
 		}
-		args = append(args, text)
+		args = append(args, string(text))
 	}
 	switch command {
 	case "ls-refs":
@@ -242,6 +274,34 @@ func gitUploadPackV2(w http.ResponseWriter, repo *Repo, body []byte) {
 	default:
 		w.WriteHeader(http.StatusBadRequest)
 	}
+}
+
+// lsRefsCache memoises v2 ls-refs responses: the bytes are a pure function of
+// (repo, refsVersion, peel, symrefs, ref-prefix set). Ref changes bump
+// refsVersion; a tag object is content-addressed, so the same version can
+// never peel to a different target.
+var lsRefsCache sync.Map // string -> []byte
+
+func lsRefsKey(repo *Repo, peel, symrefs bool, prefixes []string) string {
+	var sb strings.Builder
+	sb.WriteString(strconv.FormatInt(repo.ID, 10))
+	sb.WriteByte('|')
+	sb.WriteString(strconv.FormatUint(refsVersionOf(repo), 10))
+	sb.WriteByte('|')
+	if peel {
+		sb.WriteByte('p')
+	}
+	if symrefs {
+		sb.WriteByte('s')
+	}
+	sb.WriteByte('|')
+	sorted := append([]string(nil), prefixes...)
+	sort.Strings(sorted)
+	for _, p := range sorted {
+		sb.WriteString(p)
+		sb.WriteByte(',')
+	}
+	return sb.String()
 }
 
 // gitLsRefsV2 answers a v2 ls-refs request.
@@ -258,14 +318,19 @@ func gitLsRefsV2(w http.ResponseWriter, repo *Repo, args []string) {
 			prefixes = append(prefixes, strings.TrimPrefix(arg, "ref-prefix "))
 		}
 	}
+	key := lsRefsKey(repo, peel, symrefs, prefixes)
+	if cached, ok := lsRefsCache.Load(key); ok {
+		writeGitBytes(w, "application/x-git-upload-pack-result", cached.([]byte))
+		return
+	}
 	refs := repo.ListRefs()
-	var buf bytes.Buffer
+	buf := make([]byte, 0, 256)
 	mainTip, hasMain := refs["refs/heads/main"]
 	if len(prefixes) == 0 && symrefs {
 		if hasMain {
-			buf.Write(pktLine([]byte(mainTip + " HEAD symref-target:refs/heads/main\n")))
+			buf = appendPktLine(buf, []byte(mainTip+" HEAD symref-target:refs/heads/main\n"))
 		} else {
-			buf.Write(pktLine([]byte("unborn HEAD symref-target:refs/heads/main\n")))
+			buf = appendPktLine(buf, []byte("unborn HEAD symref-target:refs/heads/main\n"))
 		}
 	}
 	for _, name := range sortedRefs(refs) {
@@ -288,10 +353,11 @@ func gitLsRefsV2(w http.ResponseWriter, repo *Repo, args []string) {
 			}
 		}
 		line += "\n"
-		buf.Write(pktLine([]byte(line)))
+		buf = appendPktLine(buf, []byte(line))
 	}
-	buf.Write(pktLine(nil))
-	writeGitBytes(w, "application/x-git-upload-pack-result", buf.Bytes())
+	buf = appendPktLine(buf, nil)
+	lsRefsCache.Store(key, buf)
+	writeGitBytes(w, "application/x-git-upload-pack-result", buf)
 }
 
 // fetchRequest is a parsed fetch (v2 args or v0 want/have lines).
@@ -322,9 +388,105 @@ func parseFetchArgs(args []string) fetchRequest {
 	return req
 }
 
-// gitFetchV2 answers a v2 fetch with sectioned, sideband-framed output.
-func gitFetchV2(w http.ResponseWriter, repo *Repo, args []string) {
-	req := parseFetchArgs(args)
+// fetchRespCache memoises whole fetch responses (framing + sideband + pack):
+// a fetch response is a pure function of (repo, wants, haves, deepen,
+// shallows) — objects are content-addressed, so the same key can never mean
+// different bytes. Values are immutable and served as a single Write.
+var fetchRespCache sync.Map // string -> []byte
+
+// fetchBuildMu single-flights fetch response builds: when 50 concurrent
+// clones miss the cache together, only one builds the pack and the response;
+// the rest wait and then hit the cache.
+var fetchBuildMu sync.Mutex
+
+func fetchRespKey(repo *Repo, req fetchRequest, v2 bool) string {
+	prefix := "v0|"
+	if v2 {
+		prefix = "v2|"
+	}
+	key := prefix + packCacheKey(repo, req)
+	if len(req.shallows) == 0 {
+		return key
+	}
+	shallows := append([]string(nil), req.shallows...)
+	sort.Strings(shallows)
+	var sb strings.Builder
+	sb.WriteString(key)
+	sb.WriteString("|shallow:")
+	for _, s := range shallows {
+		sb.WriteString(s)
+		sb.WriteByte(',')
+	}
+	return sb.String()
+}
+
+// fetchAllResolved reports whether every want in req resolves to a stored
+// object (a missing want today could exist tomorrow, so such a response is
+// never cached). Mirrors the gate in cachedFetchPack.
+func fetchAllResolved(repo *Repo, req fetchRequest) bool {
+	for _, w := range req.wants {
+		if w == "" || w == zeroOID {
+			continue
+		}
+		if repo.GetObject(w) == nil {
+			return false
+		}
+	}
+	return true
+}
+
+// buildFetchResponseV2 frames a v2 fetch response: acknowledgments, optional
+// shallow-info, packfile sideband, flush.
+func buildFetchResponseV2(pack []byte, shallow, unshallow []string) []byte {
+	buf := make([]byte, 0, len(pack)+256)
+	buf = appendPktLine(buf, []byte("acknowledgments\n"))
+	buf = appendPktLine(buf, []byte("NAK\n"))
+	buf = append(buf, "0001"...)
+	if len(shallow) > 0 || len(unshallow) > 0 {
+		buf = appendPktLine(buf, []byte("shallow-info\n"))
+		for _, oid := range shallow {
+			buf = appendPktLine(buf, []byte("shallow "+oid+"\n"))
+		}
+		for _, oid := range unshallow {
+			buf = appendPktLine(buf, []byte("unshallow "+oid+"\n"))
+		}
+		buf = append(buf, "0001"...)
+	}
+	buf = appendPktLine(buf, []byte("packfile\n"))
+	buf = appendSideband(buf, pack)
+	buf = appendPktLine(buf, nil)
+	return buf
+}
+
+// buildFetchResponseV0 frames a v0 fetch response: NAK, shallow lines,
+// sideband pack, flush.
+func buildFetchResponseV0(pack []byte, shallow, unshallow []string) []byte {
+	buf := make([]byte, 0, len(pack)+128)
+	buf = appendPktLine(buf, []byte("NAK\n"))
+	for _, oid := range shallow {
+		buf = appendPktLine(buf, []byte("shallow "+oid+"\n"))
+	}
+	for _, oid := range unshallow {
+		buf = appendPktLine(buf, []byte("unshallow "+oid+"\n"))
+	}
+	buf = appendSideband(buf, pack)
+	buf = appendPktLine(buf, nil)
+	return buf
+}
+
+// cachedFetchResponse returns a precomputed fetch response when one is cached
+// (or can be built and cached); ok is false when the request must not be
+// cached (an unresolvable want), in which case the caller builds fresh.
+func cachedFetchResponse(repo *Repo, req fetchRequest, v2 bool) ([]byte, bool) {
+	key := fetchRespKey(repo, req, v2)
+	if cached, ok := fetchRespCache.Load(key); ok {
+		return cached.([]byte), true
+	}
+	fetchBuildMu.Lock()
+	defer fetchBuildMu.Unlock()
+	if cached, ok := fetchRespCache.Load(key); ok {
+		return cached.([]byte), true
+	}
 	var pack []byte
 	var shallow, unshallow []string
 	if cached, ok := fetchPack(repo, req); ok {
@@ -335,24 +497,37 @@ func gitFetchV2(w http.ResponseWriter, repo *Repo, args []string) {
 		shallow, unshallow = s, u
 		pack = cachedFetchPack(repo, req, objects)
 	}
-	var buf bytes.Buffer
-	buf.Write(pktLine([]byte("acknowledgments\n")))
-	buf.Write(pktLine([]byte("NAK\n")))
-	buf.WriteString("0001") // delim
-	if len(shallow) > 0 || len(unshallow) > 0 {
-		buf.Write(pktLine([]byte("shallow-info\n")))
-		for _, oid := range shallow {
-			buf.Write(pktLine([]byte("shallow " + oid + "\n")))
-		}
-		for _, oid := range unshallow {
-			buf.Write(pktLine([]byte("unshallow " + oid + "\n")))
-		}
-		buf.WriteString("0001") // delim
+	if !fetchAllResolved(repo, req) {
+		return nil, false
 	}
-	buf.Write(pktLine([]byte("packfile\n")))
-	writeSideband(&buf, pack)
-	buf.Write(pktLine(nil))
-	writeGitBytes(w, "application/x-git-upload-pack-result", buf.Bytes())
+	var resp []byte
+	if v2 {
+		resp = buildFetchResponseV2(pack, shallow, unshallow)
+	} else {
+		resp = buildFetchResponseV0(pack, shallow, unshallow)
+	}
+	fetchRespCache.Store(key, resp)
+	return resp, true
+}
+
+// gitFetchV2 answers a v2 fetch with sectioned, sideband-framed output.
+func gitFetchV2(w http.ResponseWriter, repo *Repo, args []string) {
+	req := parseFetchArgs(args)
+	if resp, ok := cachedFetchResponse(repo, req, true); ok {
+		writeGitBytes(w, "application/x-git-upload-pack-result", resp)
+		return
+	}
+	var pack []byte
+	var shallow, unshallow []string
+	if cached, ok := fetchPack(repo, req); ok {
+		pack = cached
+		shallow, unshallow = shallowInfo(repo, req)
+	} else {
+		objects, s, u := computeFetch(repo, req)
+		shallow, unshallow = s, u
+		pack = cachedFetchPack(repo, req, objects)
+	}
+	writeGitBytes(w, "application/x-git-upload-pack-result", buildFetchResponseV2(pack, shallow, unshallow))
 }
 
 // gitUploadPackV0 answers a v0 fetch (want/have lines, no sections).
@@ -389,6 +564,10 @@ func gitUploadPackV0(w http.ResponseWriter, repo *Repo, body []byte) {
 		}
 		_ = section
 	}
+	if resp, ok := cachedFetchResponse(repo, req, false); ok {
+		writeGitBytes(w, "application/x-git-upload-pack-result", resp)
+		return
+	}
 	var pack []byte
 	var shallow, unshallow []string
 	if cached, ok := fetchPack(repo, req); ok {
@@ -399,17 +578,7 @@ func gitUploadPackV0(w http.ResponseWriter, repo *Repo, body []byte) {
 		shallow, unshallow = s, u
 		pack = cachedFetchPack(repo, req, objects)
 	}
-	var buf bytes.Buffer
-	buf.Write(pktLine([]byte("NAK\n")))
-	for _, oid := range shallow {
-		buf.Write(pktLine([]byte("shallow " + oid + "\n")))
-	}
-	for _, oid := range unshallow {
-		buf.Write(pktLine([]byte("unshallow " + oid + "\n")))
-	}
-	writeSideband(&buf, pack)
-	buf.Write(pktLine(nil))
-	writeGitBytes(w, "application/x-git-upload-pack-result", buf.Bytes())
+	writeGitBytes(w, "application/x-git-upload-pack-result", buildFetchResponseV0(pack, shallow, unshallow))
 }
 
 // packCache memoises built packfiles: the clone workload issues 50 identical
@@ -570,24 +739,29 @@ func buildFetchPack(objects map[string]*GitObject) []byte {
 	return writePack(list)
 }
 
-// writeSideband writes data as band-1 sideband packets (≤65515 data bytes each).
-func writeSideband(buf *bytes.Buffer, data []byte) {
+// appendSideband appends data as band-1 sideband packets (≤65515 data bytes
+// each) to buf. Identical bytes to the previous writeSideband.
+func appendSideband(buf []byte, data []byte) []byte {
 	const maxChunk = 65515
 	if len(data) == 0 {
-		buf.Write(pktLine([]byte{1}))
-		return
+		return appendPktLine(buf, []byte{1})
 	}
 	for len(data) > 0 {
 		n := len(data)
 		if n > maxChunk {
 			n = maxChunk
 		}
-		payload := make([]byte, 0, n+1)
-		payload = append(payload, 1)
-		payload = append(payload, data[:n]...)
-		buf.Write(pktLine(payload))
+		length := 4 + 1 + n
+		buf = append(buf,
+			hexDigit(byte(length>>12)),
+			hexDigit(byte(length>>8)),
+			hexDigit(byte(length>>4)),
+			hexDigit(byte(length)),
+			1)
+		buf = append(buf, data[:n]...)
 		data = data[n:]
 	}
+	return buf
 }
 
 // ---------------------------------------------------------------- receive-pack
@@ -596,6 +770,32 @@ type pushCommand struct {
 	oldOID string
 	newOID string
 	ref    string
+}
+
+// fieldsOf splits a line on ASCII whitespace runs, mirroring strings.Fields
+// for the ASCII inputs a git client sends (oids, ref names, capabilities).
+// A field is returned as a subslice of line: no allocation.
+func fieldsOf(line []byte) [][]byte {
+	var out [][]byte
+	i := 0
+	for i < len(line) {
+		for i < len(line) && isSpaceByte(line[i]) {
+			i++
+		}
+		if i >= len(line) {
+			break
+		}
+		start := i
+		for i < len(line) && !isSpaceByte(line[i]) {
+			i++
+		}
+		out = append(out, line[start:i])
+	}
+	return out
+}
+
+func isSpaceByte(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == '\v' || b == '\f'
 }
 
 // gitReceivePack handles a push: parse commands + pack, store objects, apply
@@ -607,6 +807,8 @@ func gitReceivePack(w http.ResponseWriter, r *http.Request, repo *Repo) {
 		return
 	}
 	// Parse pkt-lines until the flush; the rest of the body is the raw pack.
+	// Command lines are parsed on the raw bytes: no string(payload) copy,
+	// no strings.Fields allocation per line.
 	reader := &pktLineReader{data: body}
 	var commands []pushCommand
 	sideband := false
@@ -621,21 +823,20 @@ func gitReceivePack(w http.ResponseWriter, r *http.Request, repo *Repo) {
 			packStart = reader.pos
 			break
 		}
-		text := string(payload)
+		line := payload
 		// First line may carry "\0<capabilities>".
-		if i := strings.Index(text, "\x00"); i >= 0 {
-			caps := text[i+1:]
-			if strings.Contains(caps, "side-band-64k") {
+		if i := bytes.IndexByte(line, 0); i >= 0 {
+			if bytes.Contains(line[i+1:], []byte("side-band-64k")) {
 				sideband = true
 			}
-			text = text[:i]
+			line = line[:i]
 		}
-		text = strings.TrimSuffix(text, "\n")
-		fields := strings.Fields(text)
+		line = bytes.TrimSuffix(line, []byte("\n"))
+		fields := fieldsOf(line)
 		if len(fields) != 3 {
 			continue
 		}
-		commands = append(commands, pushCommand{oldOID: fields[0], newOID: fields[1], ref: fields[2]})
+		commands = append(commands, pushCommand{oldOID: string(fields[0]), newOID: string(fields[1]), ref: string(fields[2])})
 	}
 
 	packOK := true
@@ -644,36 +845,36 @@ func gitReceivePack(w http.ResponseWriter, r *http.Request, repo *Repo) {
 		if err != nil {
 			packOK = false
 		} else {
-			for _, obj := range objects {
-				repo.PutObject(obj.Type, obj.Data)
+			// readPack already computed each oid once; store precomputed
+			// instead of hashing every object a second time in PutObject.
+			for _, po := range objects {
+				repo.PutObjectPrecomputed(po.oid, po.obj)
 			}
 		}
 	}
 
 	// Build the report (inner pkt-lines), then wrap in sideband when asked.
-	var inner bytes.Buffer
+	inner := make([]byte, 0, 128)
 	if packOK {
-		inner.Write(pktLine([]byte("unpack ok\n")))
+		inner = appendPktLine(inner, []byte("unpack ok\n"))
 	} else {
-		inner.Write(pktLine([]byte("unpack failed to parse pack\n")))
+		inner = appendPktLine(inner, []byte("unpack failed to parse pack\n"))
 	}
 	for _, cmd := range commands {
 		status, reason := applyPush(repo, cmd, packOK)
 		if status == "ok" {
-			inner.Write(pktLine([]byte("ok " + cmd.ref + "\n")))
+			inner = appendPktLine(inner, []byte("ok "+cmd.ref+"\n"))
 		} else {
-			inner.Write(pktLine([]byte("ng " + cmd.ref + " " + reason + "\n")))
+			inner = appendPktLine(inner, []byte("ng "+cmd.ref+" "+reason+"\n"))
 		}
 	}
-	inner.Write(pktLine(nil))
+	inner = appendPktLine(inner, nil)
 
 	if sideband {
-		var buf bytes.Buffer
-		writeSideband(&buf, inner.Bytes())
-		writeGitBytes(w, "application/x-git-receive-pack-result", buf.Bytes())
+		writeGitBytes(w, "application/x-git-receive-pack-result", appendSideband(nil, inner))
 		return
 	}
-	writeGitBytes(w, "application/x-git-receive-pack-result", inner.Bytes())
+	writeGitBytes(w, "application/x-git-receive-pack-result", inner)
 }
 
 // applyPush applies one push command. It returns ("ok", "") or ("ng", reason).
@@ -724,6 +925,10 @@ func isHexOID(s string) bool {
 	if len(s) != 40 {
 		return false
 	}
-	_, err := hex.DecodeString(s)
-	return err == nil
+	for i := 0; i < len(s); i++ {
+		if hexVal(s[i]) < 0 {
+			return false
+		}
+	}
+	return true
 }
