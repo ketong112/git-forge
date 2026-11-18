@@ -17,6 +17,7 @@ import (
 	"io"
 	"sort"
 	"strconv"
+	"sync"
 )
 
 // ---------------------------------------------------------------- pkt-line
@@ -44,6 +45,37 @@ func hexDigit(b byte) byte {
 	return 'a' + b - 10
 }
 
+// appendPktLine appends one pkt-line frame to buf: a 4-hex-digit length
+// (including the 4 length bytes) followed by the payload. A nil payload is
+// the flush packet ("0000"). Unlike pktLine it allocates nothing: the caller
+// owns buf and reuses it across lines. The bytes produced are identical to
+// pktLine's.
+func appendPktLine(buf []byte, payload []byte) []byte {
+	if payload == nil {
+		return append(buf, '0', '0', '0', '0')
+	}
+	length := 4 + len(payload)
+	buf = append(buf,
+		hexDigit(byte(length>>12)),
+		hexDigit(byte(length>>8)),
+		hexDigit(byte(length>>4)),
+		hexDigit(byte(length)))
+	return append(buf, payload...)
+}
+
+// hexVal parses one hex digit, -1 when the byte is not hex.
+func hexVal(b byte) int {
+	switch {
+	case b >= '0' && b <= '9':
+		return int(b - '0')
+	case b >= 'a' && b <= 'f':
+		return int(b-'a') + 10
+	case b >= 'A' && b <= 'F':
+		return int(b-'A') + 10
+	}
+	return -1
+}
+
 // pktLineReader reads pkt-line frames from a stream.
 type pktLineReader struct {
 	data []byte
@@ -54,9 +86,23 @@ func (r *pktLineReader) next() ([]byte, error) {
 	if r.pos+4 > len(r.data) {
 		return nil, io.EOF
 	}
-	length, err := strconv.ParseInt(string(r.data[r.pos:r.pos+4]), 16, 32)
-	if err != nil || length < 0 || length > 65520 {
-		return nil, fmt.Errorf("bad pkt-line length %q", string(r.data[r.pos:r.pos+4]))
+	// Parse the 4-hex-digit length by hand: strconv.ParseInt(string(...))
+	// allocates a string per packet. Equivalent to ParseInt(s, 16, 32) on
+	// the same 4 bytes, including its acceptance of a leading '+'.
+	raw := r.data[r.pos : r.pos+4]
+	length := 0
+	for i, b := range raw {
+		if i == 0 && b == '+' {
+			continue
+		}
+		v := hexVal(b)
+		if v < 0 {
+			return nil, fmt.Errorf("bad pkt-line length %q", string(raw))
+		}
+		length = length*16 + v
+	}
+	if length < 0 || length > 65520 {
+		return nil, fmt.Errorf("bad pkt-line length %q", string(raw))
 	}
 	r.pos += 4
 	if length == 0 {
@@ -105,6 +151,77 @@ func zlibDecompress(data []byte) ([]byte, error) {
 	}
 	defer r.Close()
 	return io.ReadAll(r)
+}
+
+// fastGitOID is GitOID without the per-write allocations: the "<type> <len>\0"
+// header is built on the stack and the hex encoding lands in a stack array,
+// so the only allocation is the returned string itself (the map key).
+func fastGitOID(typ string, data []byte) string {
+	var hdr [32]byte
+	n := copy(hdr[:], typ)
+	hdr[n] = ' '
+	n++
+	n += appendDecimal(hdr[n:], len(data))
+	hdr[n] = 0
+	n++
+	h := sha1.New()
+	h.Write(hdr[:n])
+	h.Write(data)
+	var sum [20]byte
+	h.Sum(sum[:0])
+	var out [40]byte
+	hex.Encode(out[:], sum[:])
+	return string(out[:])
+}
+
+// appendDecimal writes n in decimal into buf, returning the bytes written.
+func appendDecimal(buf []byte, n int) int {
+	if n == 0 {
+		buf[0] = '0'
+		return 1
+	}
+	// Count digits, then fill backwards.
+	digits := 0
+	for m := n; m > 0; m /= 10 {
+		digits++
+	}
+	for i := digits - 1; i >= 0; i-- {
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return digits
+}
+
+// zlibReaderPool reuses zlib readers across inflates: a fresh zlib.NewReader
+// allocates a bufio buffer and a flate decompressor per stream. Pooled
+// readers are reset with zlib.Resetter; the underlying bytes.Reader
+// implements flate.Reader, so the decompressor never over-reads and the
+// consumed-length accounting in inflateAt stays exact.
+var zlibReaderPool sync.Pool // io.ReadCloser
+
+// inflateBufPool reuses the intermediate buffer inflateAt reads into; the
+// retained object data is copied out of it into an exactly-sized slice, so a
+// pooled buffer is never aliased by a stored object.
+var inflateBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
+func pooledZlibReader(br *bytes.Reader) (io.ReadCloser, error) {
+	if v := zlibReaderPool.Get(); v != nil {
+		r := v.(io.ReadCloser)
+		if rs, ok := r.(zlib.Resetter); ok {
+			if err := rs.Reset(br, nil); err == nil {
+				return r, nil
+			}
+		}
+		// Reset failed: drop the pooled reader; rewind (Reset may have
+		// consumed the header) and fall through to a fresh one.
+		_, _ = br.Seek(0, io.SeekStart)
+	}
+	return zlib.NewReader(br)
+}
+
+func releaseZlibReader(r io.ReadCloser) {
+	_ = r.Close()
+	zlibReaderPool.Put(r)
 }
 
 // ---------------------------------------------------------------- packfile writing
@@ -183,9 +300,17 @@ type packEntry struct {
 	baseOf int    // OFS_DELTA base offset, -1 when none
 }
 
-// readPack parses a packfile into objects (deltas applied). It returns the
-// objects in pack order.
-func readPack(pack []byte) ([]*GitObject, error) {
+// packedObject is one parsed pack entry with its oid already computed.
+type packedObject struct {
+	oid string
+	obj *GitObject
+}
+
+// readPack parses a packfile into objects (deltas applied) with each
+// object's oid computed once, while parsing, so callers can store objects
+// with PutObjectPrecomputed instead of hashing them a second time. It
+// returns the objects in pack order.
+func readPack(pack []byte) ([]packedObject, error) {
 	if len(pack) < 12 || string(pack[:4]) != "PACK" {
 		return nil, errors.New("not a packfile")
 	}
@@ -253,17 +378,17 @@ func readPack(pack []byte) ([]*GitObject, error) {
 	}
 	// Resolve deltas. Entries are resolved in pack order; a delta's base may
 	// itself be a delta, so resolve recursively with memoisation.
-	resolved := make([]*GitObject, len(entries))
-	var resolve func(i int) (*GitObject, error)
-	resolve = func(i int) (*GitObject, error) {
-		if resolved[i] != nil {
+	resolved := make([]packedObject, len(entries))
+	var resolve func(i int) (packedObject, error)
+	resolve = func(i int) (packedObject, error) {
+		if resolved[i].obj != nil {
 			return resolved[i], nil
 		}
 		entry := entries[i]
 		if entry.typ != "" {
-			obj := &GitObject{Type: entry.typ, Data: entry.data}
-			resolved[i] = obj
-			return obj, nil
+			po := packedObject{oid: fastGitOID(entry.typ, entry.data), obj: &GitObject{Type: entry.typ, Data: entry.data}}
+			resolved[i] = po
+			return po, nil
 		}
 		var base *GitObject
 		var err error
@@ -271,7 +396,7 @@ func readPack(pack []byte) ([]*GitObject, error) {
 			// REF_DELTA: find the base by oid among the already-known entries.
 			base, err = findPackBase(entries, resolved, entry.base)
 			if err != nil {
-				return nil, err
+				return packedObject{}, err
 			}
 		} else {
 			// OFS_DELTA: find the entry starting at baseOf.
@@ -285,22 +410,23 @@ func readPack(pack []byte) ([]*GitObject, error) {
 				off += len(raw[j])
 			}
 			if baseIndex < 0 {
-				return nil, fmt.Errorf("ofs-delta base at offset %d not found", entry.baseOf)
+				return packedObject{}, fmt.Errorf("ofs-delta base at offset %d not found", entry.baseOf)
 			}
-			base, err = resolve(baseIndex)
+			basePO, err := resolve(baseIndex)
 			if err != nil {
-				return nil, err
+				return packedObject{}, err
 			}
+			base = basePO.obj
 		}
 		data, err := applyDelta(base.Data, entry.data)
 		if err != nil {
-			return nil, err
+			return packedObject{}, err
 		}
-		obj := &GitObject{Type: base.Type, Data: data}
-		resolved[i] = obj
-		return obj, nil
+		po := packedObject{oid: fastGitOID(base.Type, data), obj: &GitObject{Type: base.Type, Data: data}}
+		resolved[i] = po
+		return po, nil
 	}
-	objects := make([]*GitObject, 0, len(entries))
+	objects := make([]packedObject, 0, len(entries))
 	for i := range entries {
 		obj, err := resolve(i)
 		if err != nil {
@@ -327,15 +453,14 @@ func typeName(typ int) string {
 
 // findPackBase locates a REF_DELTA base by oid (already resolved entries first,
 // then by hashing unresolved plain entries).
-func findPackBase(entries []*packEntry, resolved []*GitObject, oid string) (*GitObject, error) {
-	for i, obj := range resolved {
-		if obj == nil {
+func findPackBase(entries []*packEntry, resolved []packedObject, oid string) (*GitObject, error) {
+	for _, po := range resolved {
+		if po.obj == nil {
 			continue
 		}
-		if GitOID(obj.Type, obj.Data) == oid {
-			return obj, nil
+		if po.oid == oid {
+			return po.obj, nil
 		}
-		_ = i
 	}
 	for _, entry := range entries {
 		if entry.typ == "" {
@@ -392,19 +517,27 @@ func readOffsetEncoding(data []byte) (offset int, used int, err error) {
 // inflateAt inflates one zlib stream starting at data[0] and reports how many
 // input bytes it consumed. A bytes.Reader implements flate's Reader interface,
 // so the decompressor reads byte-by-byte with no over-read, and the reader's
-// position after the stream is the exact consumed length.
+// position after the stream is the exact consumed length. The zlib reader and
+// the intermediate buffer are pooled; the returned slice is freshly allocated
+// at exactly the inflated size.
 func inflateAt(data []byte) ([]byte, int, error) {
 	br := bytes.NewReader(data)
-	r, err := zlib.NewReader(br)
+	r, err := pooledZlibReader(br)
 	if err != nil {
 		return nil, 0, err
 	}
-	defer r.Close()
-	out, err := io.ReadAll(r)
-	if err != nil {
-		return nil, 0, err
-	}
+	buf := inflateBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	_, rerr := buf.ReadFrom(r)
 	used, _ := br.Seek(0, io.SeekCurrent)
+	releaseZlibReader(r)
+	if rerr != nil {
+		inflateBufPool.Put(buf)
+		return nil, 0, rerr
+	}
+	out := make([]byte, buf.Len())
+	copy(out, buf.Bytes())
+	inflateBufPool.Put(buf)
 	return out, int(used), nil
 }
 

@@ -121,3 +121,28 @@
   (go/*.go) for authorship; binary built locally from it.
 - Node pure-stdlib is now FALLBACK only. Pivot changes the estimate: Go core is a bigger build
   (~12–20 h) but it is the only architecture that can reach perf > 166.
+
+## SUBMITTED round 1 — 18 Nov 2026 ~23:40 WIB ✅
+- Repo https://github.com/ketong112/git-forge, HEAD caabb1c2503fb74e449b35b56530aeb459cf821a (3 commit web upload, clone+diff byte-identical, local git init + reset --hard origin/main).
+- Bundle git-forge-bundle.tar.gz 1.979.375 byte, sha256 0db3d5c4f18e48edcfbaf91095826c9b0f29167a3b4d4c86cf44b9a44f41ade0; 5 sesi; usage file 184 baris (36 attached). Kit check 15 passed, 0 failed (entry_size 6.465.127 ≤ 16.777.216, forge-core 6.287.544 ≤ 8.388.608; thinking_reproduces 96,4%; thinking_priced 36).
+- Submission 01a1ef87-600e-74c5-ac8a-6d328f8848a3, claim code AF-16SYN-B7BFJ-S812Q-92MBD, judul "GitForge: Static Go Core + Thin Node Launcher".
+- Status poll ~23:41 WIB: Round 1 passed every validity check, grading dev under way. Catatan: security_audit SKIP "flagged ... graded as submitted" (kemungkinan karena binary vendored — tetap dinilai, bukan fail). repo_about: rekomendasi tambah topik ai-agents, bounties + deskripsi (opsional, belum dilakukan).
+- Skor live (trial practice instance 1) menyusul — cek status / leaderboard.
+
+## LIVE SCORE round 1 — 18 Nov 2026 ~23:45 WIB
+- Skor 916 (feature 600 + agent 200 + perf 116), perf_p50_us 643.506, rank 6147/8430, prize_rank 6109, status finished.
+- Pembanding: #1 vinzsenzo 966 (perf 166, p50 322.015); top-100 mulai ~940. Gap kita murni kecepatan: p50 kita ~2x lebih lambat dari #1. Feature + agent sudah maksimal (600+200).
+- Target round 2: perf ≥160 (p50 ≤ ~300.000 µs, skor ≥960). Kandidat optimasi: pack delta, hand-rolled TCP/HTTP, JSON response cache, zero-alloc hot paths, zlib tuning. Round 2 dikoordinir semalam.
+
+## ROUND 2 BUILD — 19 Nov 2026 ~00:20 WIB (koordinator + 3 subagent)
+- Target: perf live 116 → ≥160 (p50 ≤ ~300.000 µs). Feature + agent sudah maksimal (600+200).
+- REST (subagent 9d31f6c9): go/issuecache.go BARU — cache body JSON issue per (repo, number), self-validating (snapshot field, revalidasi di bawah read lock; aman dari mutasi GraphQL/MCP); header request-id tetap fresh per request. restIssueCreate fast path: scanner JSON hand-rolled + renderer hand-rolled (fallback ke encoding/json bila ada label/escape). checkAuth tanpa concat, writeJSON satu Write, splitPathSegments index-based.
+- GIT (subagent cdf40089): push — parse command dari []byte, readPack kembalikan oid (SHA-1 sekali, PutObjectPrecomputed), isHexOID manual, isDescendant fast path (parent pertama == oldOID). Clone — response ls-refs v2 + fetch UTUH di-precompute per kunci, single-flight build pack, advertisement v2 statis. appendPktLine/appendSideband tanpa alokasi; pool zlib.Reader + bytes.Buffer di inflateAt.
+- TRANSPORT (subagent a34ca3de): go/transport.go — server HTTP/1.1 hand-rolled (accept loop, parse manual, keep-alive, Content-Length + chunked, Expect 100-continue), DI-WIRE ke main.go (ganti http.Server; ln.Close() saat SIGTERM). GC tuning (SetGCPercent 400/800) DITOLAK — lebih lambat, main.go di-revert kecuali wiring. Harness A/B + rawbench di ~/workspace/makefun/git-forge-bench/ (di luar repo).
+- Integrasi (koordinator): verifikasi gabungan via main.ts (boot path asli), runner penuh + --perf:
+  * gabungan + net/http: 120/120, perf 56 (push 21, clone 14, read 13, write 8), p50 1.494.851
+  * gabungan + transport run 1: 120/120, perf 62 (push 26, clone 13, read 13, write 10), p50 1.373.914
+  * gabungan + transport run 2: 120/120, perf 73 (push 25, clone 17, read 18, write 13), p50 1.173.517
+  Binary 4.542.756 byte (transport membuat net/http Server tidak ter-link; ≤8 MiB). gofmt + vet bersih.
+- Mikro (raw client, server-side murni): read −24%, write −30%, push −13%, clone −43% vs round 1. Angka lokal tetap jauh dari target karena didominasi client Node + throttling VM — skor produksi baru ketahuan setelah submit.
+- NEXT (parent): upload GitHub (commit baru), kit check, bundle (sesi baru), submit round 2 + status. Deadline 21 Nov 13:30 WIB.

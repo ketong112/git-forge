@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // ---------------------------------------------------------------- helpers
@@ -303,12 +304,35 @@ func restHandler(w http.ResponseWriter, r *http.Request, store *Store) {
 	writeErr(w, http.StatusNotFound, "Not Found")
 }
 
+// splitPathSegments splits a path on "/". It scans by index with one
+// pre-sized allocation instead of strings.Trim + strings.Split.
 func splitPathSegments(path string) []string {
-	path = strings.Trim(path, "/")
-	if path == "" {
+	start := 0
+	for start < len(path) && path[start] == '/' {
+		start++
+	}
+	end := len(path)
+	for end > start && path[end-1] == '/' {
+		end--
+	}
+	if start >= end {
 		return nil
 	}
-	return strings.Split(path, "/")
+	n := 1
+	for i := start; i < end; i++ {
+		if path[i] == '/' {
+			n++
+		}
+	}
+	out := make([]string, 0, n)
+	segStart := start
+	for i := start; i <= end; i++ {
+		if i == end || path[i] == '/' {
+			out = append(out, path[segStart:i])
+			segStart = i + 1
+		}
+	}
+	return out
 }
 
 // restUser handles /api/v3/user and /api/v3/user/repos.
@@ -429,6 +453,7 @@ func restRepos(w http.ResponseWriter, r *http.Request, store *Store, rest []stri
 			writeJSON(w, http.StatusOK, repoJSON(repo))
 		case http.MethodDelete:
 			store.DeleteRepo(owner, name)
+			issueCachePurgeRepo(repo)
 			writeNoContent(w)
 		default:
 			writeErr(w, http.StatusNotFound, "Not Found")
@@ -856,7 +881,13 @@ func restIssues(w http.ResponseWriter, r *http.Request, store *Store, owner, nam
 		}
 		switch r.Method {
 		case http.MethodGet:
-			writeJSON(w, http.StatusOK, fastIssueJSON(repo, issue))
+			if data, ok := issueCacheGet(repo, issue); ok {
+				writeRawJSON(w, http.StatusOK, data)
+			} else if data := buildAndCacheIssueJSON(repo, issue); data != nil {
+				writeRawJSON(w, http.StatusOK, data)
+			} else {
+				writeJSON(w, http.StatusOK, fastIssueJSON(repo, issue))
+			}
 		case http.MethodPatch:
 			body, ok := readJSONBody(w, r)
 			if !ok {
@@ -877,7 +908,11 @@ func restIssues(w http.ResponseWriter, r *http.Request, store *Store, owner, nam
 					repo.mu.Unlock()
 				}
 			}
-			writeJSON(w, http.StatusOK, fastIssueJSON(repo, issue))
+			if data := buildAndCacheIssueJSON(repo, issue); data != nil {
+				writeRawJSON(w, http.StatusOK, data)
+			} else {
+				writeJSON(w, http.StatusOK, fastIssueJSON(repo, issue))
+			}
 		default:
 			writeErr(w, http.StatusNotFound, "Not Found")
 		}
@@ -896,6 +931,7 @@ func restIssues(w http.ResponseWriter, r *http.Request, store *Store, owner, nam
 				return
 			}
 			comment := repo.AddComment(store, issue, bodyString(body, "body"))
+			issueCacheInvalidate(repo, number)
 			writeJSON(w, http.StatusCreated, map[string]any{
 				"id":         comment.ID,
 				"body":       comment.Body,
@@ -932,6 +968,27 @@ func restIssueCreate(w http.ResponseWriter, r *http.Request, store *Store, repo 
 		writeErr(w, http.StatusBadRequest, "Bad Request")
 		return
 	}
+	// Fast path: flat object, string title/body, no labels (or an empty/null
+	// labels array) — the shape the write workload sends. Anything unusual
+	// falls through to the full decoder below, which stays authoritative.
+	if title, body, ok := scanIssueCreate(data); ok {
+		if title == "" {
+			writeErr(w, http.StatusUnprocessableEntity, "title is required")
+			return
+		}
+		issue := repo.CreateIssue(store, title, body, nil)
+		if wire, ok := renderIssueCreateWire(issue.ID, issue.Number, title, body); ok {
+			issueCacheStoreRaw(repo, issue.Number, wire, title, body)
+			writeRawJSON(w, http.StatusCreated, wire)
+			return
+		}
+		if wire := buildAndCacheIssueJSON(repo, issue); wire != nil {
+			writeRawJSON(w, http.StatusCreated, wire)
+			return
+		}
+		writeJSON(w, http.StatusCreated, fastIssueJSON(repo, issue))
+		return
+	}
 	var in issueCreateIn
 	if len(data) > 0 {
 		if err := json.Unmarshal(data, &in); err != nil {
@@ -951,7 +1008,421 @@ func restIssueCreate(w http.ResponseWriter, r *http.Request, store *Store, repo 
 		}
 	}
 	issue := repo.CreateIssue(store, in.Title, in.Body, labels)
+	if wire := buildAndCacheIssueJSON(repo, issue); wire != nil {
+		writeRawJSON(w, http.StatusCreated, wire)
+		return
+	}
 	writeJSON(w, http.StatusCreated, fastIssueJSON(repo, issue))
+}
+
+// ---------------------------------------------------------------------------
+// POST /issues fast path: hand-rolled JSON scanning and response rendering.
+//
+// scanIssueCreate extracts the top-level "title" and "body" strings without
+// encoding/json. It is deliberately strict: any malformed JSON, any
+// non-string title/body, any non-empty labels array, or any escaped key
+// returns ok=false and the caller uses the full decoder, so behavior for
+// every unusual body is exactly the old behavior. Duplicate keys keep the
+// last value, matching encoding/json.
+func scanIssueCreate(data []byte) (title, body string, ok bool) {
+	if len(data) == 0 {
+		return "", "", true
+	}
+	p := &jsonScanner{data: data}
+	if !p.ws() || p.data[p.i] != '{' {
+		return "", "", false
+	}
+	p.i++
+	if !p.ws() {
+		return "", "", false
+	}
+	if p.data[p.i] == '}' {
+		p.i++
+		return p.finish(title, body)
+	}
+	for {
+		if p.data[p.i] != '"' {
+			return "", "", false
+		}
+		start, end, hasEscape, ok := p.stringToken()
+		if !ok || hasEscape {
+			// Escaped keys are rare; let the full decoder handle them.
+			return "", "", false
+		}
+		key := string(p.data[start+1 : end-1])
+		if !p.ws() || p.data[p.i] != ':' {
+			return "", "", false
+		}
+		p.i++
+		if !p.ws() {
+			return "", "", false
+		}
+		switch key {
+		case "title", "body":
+			s, ok := p.stringOrNull()
+			if !ok {
+				return "", "", false
+			}
+			if key == "title" {
+				title = s
+			} else {
+				body = s
+			}
+		case "labels":
+			if !p.labelsEmptyOrNull() {
+				return "", "", false
+			}
+		default:
+			if !p.skipValue() {
+				return "", "", false
+			}
+		}
+		if !p.ws() {
+			return "", "", false
+		}
+		switch p.data[p.i] {
+		case ',':
+			p.i++
+			if !p.ws() {
+				return "", "", false
+			}
+		case '}':
+			p.i++
+			return p.finish(title, body)
+		default:
+			return "", "", false
+		}
+	}
+}
+
+func (p *jsonScanner) finish(title, body string) (string, string, bool) {
+	p.ws()
+	if !p.eof() {
+		return "", "", false
+	}
+	return title, body, true
+}
+
+// jsonScanner is a strict, allocation-light JSON reader for the create-issue
+// fast path. It validates as it scans; any deviation bails to the slow path.
+type jsonScanner struct {
+	data []byte
+	i    int
+}
+
+func (p *jsonScanner) eof() bool { return p.i >= len(p.data) }
+
+// ws skips JSON whitespace; it reports false at end of input.
+func (p *jsonScanner) ws() bool {
+	for p.i < len(p.data) {
+		switch p.data[p.i] {
+		case ' ', '\t', '\n', '\r':
+			p.i++
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+func isHex(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+// stringToken parses a JSON string starting at the opening quote. It returns
+// the token bounds (including quotes), whether it contains a backslash
+// escape, and whether the token is well-formed.
+func (p *jsonScanner) stringToken() (start, end int, hasEscape bool, ok bool) {
+	start = p.i
+	p.i++
+	for {
+		if p.eof() {
+			return 0, 0, false, false
+		}
+		c := p.data[p.i]
+		if c == '"' {
+			p.i++
+			return start, p.i, hasEscape, true
+		}
+		if c == '\\' {
+			hasEscape = true
+			p.i++
+			if p.eof() {
+				return 0, 0, false, false
+			}
+			switch p.data[p.i] {
+			case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+				p.i++
+			case 'u':
+				p.i++
+				for k := 0; k < 4; k++ {
+					if p.eof() || !isHex(p.data[p.i]) {
+						return 0, 0, false, false
+					}
+					p.i++
+				}
+			default:
+				return 0, 0, false, false
+			}
+			continue
+		}
+		if c < 0x20 {
+			return 0, 0, false, false
+		}
+		p.i++
+	}
+}
+
+// stringOrNull parses a string value (decoding escapes when present) or a
+// JSON null (which decodes to ""). Anything else is rejected.
+func (p *jsonScanner) stringOrNull() (string, bool) {
+	if p.eof() {
+		return "", false
+	}
+	if p.data[p.i] == 'n' {
+		if !p.literal("null") {
+			return "", false
+		}
+		return "", true
+	}
+	if p.data[p.i] != '"' {
+		return "", false
+	}
+	start, end, hasEscape, ok := p.stringToken()
+	if !ok {
+		return "", false
+	}
+	if hasEscape {
+		var s string
+		if err := json.Unmarshal(p.data[start:end], &s); err != nil {
+			return "", false
+		}
+		return s, true
+	}
+	raw := string(p.data[start+1 : end-1])
+	if !utf8.ValidString(raw) {
+		// Invalid UTF-8 would be replaced by encoding/json; slow path.
+		return "", false
+	}
+	return raw, true
+}
+
+// labelsEmptyOrNull accepts a null or an empty labels array; a non-empty
+// array (or anything else) is rejected so the slow path validates it.
+func (p *jsonScanner) labelsEmptyOrNull() bool {
+	if p.eof() {
+		return false
+	}
+	if p.data[p.i] == 'n' {
+		return p.literal("null")
+	}
+	if p.data[p.i] != '[' {
+		return false
+	}
+	p.i++
+	if !p.ws() {
+		return false
+	}
+	if p.data[p.i] != ']' {
+		return false
+	}
+	p.i++
+	return true
+}
+
+func (p *jsonScanner) literal(s string) bool {
+	if p.i+len(s) > len(p.data) {
+		return false
+	}
+	if string(p.data[p.i:p.i+len(s)]) != s {
+		return false
+	}
+	p.i += len(s)
+	return true
+}
+
+// skipValue strictly skips one JSON value of any shape.
+func (p *jsonScanner) skipValue() bool {
+	if p.eof() {
+		return false
+	}
+	switch c := p.data[p.i]; {
+	case c == '"':
+		_, _, _, ok := p.stringToken()
+		return ok
+	case c == '{':
+		p.i++
+		if !p.ws() {
+			return false
+		}
+		if p.data[p.i] == '}' {
+			p.i++
+			return true
+		}
+		for {
+			if p.eof() || p.data[p.i] != '"' {
+				return false
+			}
+			if _, _, _, ok := p.stringToken(); !ok {
+				return false
+			}
+			if !p.ws() || p.data[p.i] != ':' {
+				return false
+			}
+			p.i++
+			if !p.ws() || !p.skipValue() {
+				return false
+			}
+			if !p.ws() {
+				return false
+			}
+			switch p.data[p.i] {
+			case ',':
+				p.i++
+				if !p.ws() {
+					return false
+				}
+			case '}':
+				p.i++
+				return true
+			default:
+				return false
+			}
+		}
+	case c == '[':
+		p.i++
+		if !p.ws() {
+			return false
+		}
+		if p.data[p.i] == ']' {
+			p.i++
+			return true
+		}
+		for {
+			if !p.skipValue() {
+				return false
+			}
+			if !p.ws() {
+				return false
+			}
+			switch p.data[p.i] {
+			case ',':
+				p.i++
+				if !p.ws() {
+					return false
+				}
+			case ']':
+				p.i++
+				return true
+			default:
+				return false
+			}
+		}
+	case c == 't':
+		return p.literal("true")
+	case c == 'f':
+		return p.literal("false")
+	case c == 'n':
+		return p.literal("null")
+	case c == '-' || c >= '0' && c <= '9':
+		return p.skipNumber()
+	default:
+		return false
+	}
+}
+
+// skipNumber strictly skips one JSON number.
+func (p *jsonScanner) skipNumber() bool {
+	if p.eof() {
+		return false
+	}
+	if p.data[p.i] == '-' {
+		p.i++
+		if p.eof() {
+			return false
+		}
+	}
+	if p.data[p.i] == '0' {
+		p.i++
+	} else if p.data[p.i] >= '1' && p.data[p.i] <= '9' {
+		for !p.eof() && p.data[p.i] >= '0' && p.data[p.i] <= '9' {
+			p.i++
+		}
+	} else {
+		return false
+	}
+	if !p.eof() && p.data[p.i] == '.' {
+		p.i++
+		if p.eof() || p.data[p.i] < '0' || p.data[p.i] > '9' {
+			return false
+		}
+		for !p.eof() && p.data[p.i] >= '0' && p.data[p.i] <= '9' {
+			p.i++
+		}
+	}
+	if !p.eof() && (p.data[p.i] == 'e' || p.data[p.i] == 'E') {
+		p.i++
+		if !p.eof() && (p.data[p.i] == '+' || p.data[p.i] == '-') {
+			p.i++
+		}
+		if p.eof() || p.data[p.i] < '0' || p.data[p.i] > '9' {
+			return false
+		}
+		for !p.eof() && p.data[p.i] >= '0' && p.data[p.i] <= '9' {
+			p.i++
+		}
+	}
+	return true
+}
+
+// jsonSafeString reports whether s can be copied verbatim into a JSON string
+// the way encoding/json would render it: no byte needing an escape
+// (control, quote, backslash, or the HTML-escaped < > &), no U+2028/U+2029,
+// and valid UTF-8.
+func jsonSafeString(s string) bool {
+	if !utf8.ValidString(s) {
+		return false
+	}
+	if strings.Contains(s, "\u2028") || strings.Contains(s, "\u2029") {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' {
+			return false
+		}
+	}
+	return true
+}
+
+// renderIssueCreateWire hand-builds the POST /issues response for a
+// label-less issue, byte-identical to encoding/json's rendering of the
+// issueOut struct (field order included). It returns ok=false when any
+// string needs escaping, and the caller falls back to encoding/json.
+func renderIssueCreateWire(id int64, number int, title, body string) ([]byte, bool) {
+	if !jsonSafeString(title) || !jsonSafeString(body) || !jsonSafeString(ViewerLogin) {
+		return nil, false
+	}
+	buf := make([]byte, 0, len(title)+len(body)+280)
+	buf = append(buf, `{"id":`...)
+	buf = strconv.AppendInt(buf, id, 10)
+	buf = append(buf, `,"node_id":"I_`...)
+	buf = strconv.AppendInt(buf, id, 10)
+	buf = append(buf, `","number":`...)
+	buf = strconv.AppendInt(buf, int64(number), 10)
+	buf = append(buf, `,"title":"`...)
+	buf = append(buf, title...)
+	buf = append(buf, `","body":"`...)
+	buf = append(buf, body...)
+	buf = append(buf, `","state":"open","labels":[],"user":{"login":"`...)
+	buf = append(buf, ViewerLogin...)
+	buf = append(buf, `","id":1000,"type":"User"},"created_at":"`...)
+	buf = append(buf, FixedTimestamp...)
+	buf = append(buf, `","updated_at":"`...)
+	buf = append(buf, FixedTimestamp...)
+	buf = append(buf, `","comments":0}`...)
+	buf = append(buf, '\n')
+	return buf, true
 }
 
 func restIssueList(w http.ResponseWriter, r *http.Request, repo *Repo) {

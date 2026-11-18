@@ -21,17 +21,81 @@ func splitPath(path string) []string {
 	return strings.Split(path, "/")
 }
 
+// forHeaderLines calls fn for each line of an object header (up to the blank
+// line), stopping when fn returns false. No allocation: lines are subslices
+// of data. A missing blank line means the whole object is the header,
+// matching parseCommit.
+func forHeaderLines(data []byte, fn func(line []byte) bool) {
+	end := bytes.Index(data, []byte("\n\n"))
+	header := data
+	if end >= 0 {
+		header = data[:end]
+	}
+	for len(header) > 0 {
+		i := bytes.IndexByte(header, '\n')
+		var line []byte
+		if i < 0 {
+			line, header = header, nil
+		} else {
+			line, header = header[:i], header[i+1:]
+		}
+		if !fn(line) {
+			return
+		}
+	}
+}
+
+// commitTreeBytes returns the tree oid named by a commit's header, "" when
+// absent. It scans the header lines directly on the raw bytes: no string
+// copy of the commit, no parsed Commit struct.
+func commitTreeBytes(data []byte) string {
+	tree := ""
+	forHeaderLines(data, func(line []byte) bool {
+		if bytes.HasPrefix(line, []byte("tree ")) {
+			tree = string(line[5:])
+			return false
+		}
+		return true
+	})
+	return tree
+}
+
+// commitParentsBytes returns every parent oid named by a commit's header, in
+// order. Same byte-level scan as commitTreeBytes.
+func commitParentsBytes(data []byte) []string {
+	var parents []string
+	forHeaderLines(data, func(line []byte) bool {
+		if bytes.HasPrefix(line, []byte("parent ")) {
+			parents = append(parents, string(line[7:]))
+		}
+		return true
+	})
+	return parents
+}
+
+// commitFirstParent returns the first parent oid named by a commit's header,
+// "" when the commit has no parent. Used for the fast-forward fast path:
+// a push whose new commit's first parent is the old tip is a fast-forward
+// without walking any history.
+func commitFirstParent(data []byte) string {
+	parent := ""
+	forHeaderLines(data, func(line []byte) bool {
+		if bytes.HasPrefix(line, []byte("parent ")) {
+			parent = string(line[7:])
+			return false
+		}
+		return true
+	})
+	return parent
+}
+
 // commitTree returns the tree oid of a commit object, "" when unknown.
 func (r *Repo) commitTree(commitOID string) string {
 	obj := r.GetObject(commitOID)
 	if obj == nil || obj.Type != "commit" {
 		return ""
 	}
-	c, err := parseCommit(obj.Data)
-	if err != nil {
-		return ""
-	}
-	return c.Tree
+	return commitTreeBytes(obj.Data)
 }
 
 // commitParents returns the parent oids of a commit object.
@@ -40,11 +104,12 @@ func (r *Repo) commitParents(commitOID string) []string {
 	if obj == nil || obj.Type != "commit" {
 		return nil
 	}
-	c, err := parseCommit(obj.Data)
-	if err != nil {
+	// parseCommit errors on a commit without a tree, and the old code
+	// returned nil then; preserve that for malformed objects.
+	if commitTreeBytes(obj.Data) == "" {
 		return nil
 	}
-	return c.Parents
+	return commitParentsBytes(obj.Data)
 }
 
 // treeEntries returns the parsed entries of a tree object.
@@ -416,24 +481,35 @@ func (r *Repo) markReachable(tip string, set map[string]bool) {
 	}
 }
 
-// tagTarget parses the "object <oid>" line of a tag object.
+// tagTarget parses the "object <oid>" line of a tag object. Byte-level,
+// same semantics as the previous splitLines(string(data)) version.
 func tagTarget(data []byte) string {
-	for _, line := range splitLines(string(data)) {
-		if strings.HasPrefix(line, "object ") {
-			return strings.TrimSpace(line[len("object "):])
+	target := ""
+	forHeaderLines(data, func(line []byte) bool {
+		if bytes.HasPrefix(line, []byte("object ")) {
+			target = strings.TrimSpace(string(line[len("object "):]))
+			return false
 		}
-		if line == "" {
-			break
-		}
-	}
-	return ""
+		return true
+	})
+	return target
 }
 
 // isDescendant reports whether newOID is a descendant of oldOID (or equal).
 // It walks parents from newOID; missing objects stop the walk (not a descendant).
+// Fast path: a commit whose first parent is oldOID is a direct fast-forward,
+// which is the push workload's shape — no history walk, no parseCommit.
 func (r *Repo) isDescendant(newOID, oldOID string) bool {
 	if newOID == oldOID {
 		return true
+	}
+	if obj := r.GetObject(newOID); obj != nil && obj.Type == "commit" {
+		// A commit without a tree is malformed (parseCommit errors on it);
+		// the old walk found nothing from it, so the fast path must not
+		// fire there either.
+		if commitTreeBytes(obj.Data) != "" && commitFirstParent(obj.Data) == oldOID {
+			return true
+		}
 	}
 	seen := make(map[string]bool)
 	queue := []string{newOID}
