@@ -195,7 +195,8 @@ func peeledOID(repo *Repo, ref, oid string) string {
 
 func writeGitBytes(w http.ResponseWriter, contentType string, data []byte) {
 	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	// No Content-Length: transport.go frames the response with an exact one
+	// and drops any handler-set value (see transport.go framing).
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
 }

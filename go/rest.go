@@ -8,12 +8,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf8"
 )
 
@@ -851,6 +853,90 @@ func restLabels(w http.ResponseWriter, r *http.Request, store *Store, owner, nam
 	}
 }
 
+// parseIssuePath extracts owner, repo and (when present) the issue number
+// from a path that starts with "/api/v3/repos/". It reports ok=false unless
+// the path is exactly an /issues route: POST .../issues (isCreate) or
+// GET .../issues/{positive number}. Everything else — /issues/{n}/comments,
+// PATCH, non-numeric numbers, trailing slashes — falls through to
+// restHandler, so behavior for those routes is unchanged. All results are
+// substrings of path: no allocation.
+func parseIssuePath(path string) (owner, name string, number int, isCreate bool, ok bool) {
+	const prefix = "/api/v3/repos/"
+	if len(path) < len(prefix) || path[:len(prefix)] != prefix {
+		return "", "", 0, false, false
+	}
+	rest := path[len(prefix):]
+	i := strings.IndexByte(rest, '/')
+	if i <= 0 {
+		return "", "", 0, false, false
+	}
+	owner = rest[:i]
+	rest = rest[i+1:]
+	j := strings.IndexByte(rest, '/')
+	if j <= 0 {
+		return "", "", 0, false, false
+	}
+	name = rest[:j]
+	rest = rest[j+1:]
+	if rest == "issues" {
+		return owner, name, 0, true, true
+	}
+	if !strings.HasPrefix(rest, "issues/") {
+		return "", "", 0, false, false
+	}
+	tail := rest[len("issues/"):]
+	if strings.IndexByte(tail, '/') >= 0 {
+		return "", "", 0, false, false
+	}
+	n, err := strconv.Atoi(tail)
+	if err != nil || n < 1 {
+		return "", "", 0, false, false
+	}
+	return owner, name, n, false, true
+}
+
+// serveIssueGet answers GET /issues/{n} from the response cache when valid.
+func serveIssueGet(w http.ResponseWriter, repo *Repo, issue *Issue) {
+	if data, ok := issueCacheGet(repo, issue); ok {
+		writeRawJSON(w, http.StatusOK, data)
+	} else if data := buildAndCacheIssueJSON(repo, issue); data != nil {
+		writeRawJSON(w, http.StatusOK, data)
+	} else {
+		writeJSON(w, http.StatusOK, fastIssueJSON(repo, issue))
+	}
+}
+
+// restIssueGetFast is the dispatcher's hot path for GET one issue: auth,
+// repo lookup, issue lookup, cached render. It is the read workload's path.
+func restIssueGetFast(w http.ResponseWriter, r *http.Request, store *Store, owner, name string, number int) {
+	if !checkAuth(w, r) {
+		return
+	}
+	repo := lookupRepo(w, store, owner, name)
+	if repo == nil {
+		return
+	}
+	issue := repo.GetIssue(number)
+	if issue == nil {
+		writeErr(w, http.StatusNotFound, "Not Found")
+		return
+	}
+	serveIssueGet(w, repo, issue)
+}
+
+// restIssueCreateFast is the dispatcher's hot path for POST create issue.
+// It is the write workload's path.
+func restIssueCreateFast(w http.ResponseWriter, r *http.Request, store *Store, owner, name string) {
+	if !checkAuth(w, r) {
+		return
+	}
+	repo := lookupRepo(w, store, owner, name)
+	if repo == nil {
+		return
+	}
+	restIssueCreate(w, r, store, repo)
+}
+
 // restIssues handles /issues, /issues/{n}, /issues/{n}/comments.
 func restIssues(w http.ResponseWriter, r *http.Request, store *Store, owner, name string, tail []string) {
 	repo := lookupRepo(w, store, owner, name)
@@ -881,13 +967,7 @@ func restIssues(w http.ResponseWriter, r *http.Request, store *Store, owner, nam
 		}
 		switch r.Method {
 		case http.MethodGet:
-			if data, ok := issueCacheGet(repo, issue); ok {
-				writeRawJSON(w, http.StatusOK, data)
-			} else if data := buildAndCacheIssueJSON(repo, issue); data != nil {
-				writeRawJSON(w, http.StatusOK, data)
-			} else {
-				writeJSON(w, http.StatusOK, fastIssueJSON(repo, issue))
-			}
+			serveIssueGet(w, repo, issue)
 		case http.MethodPatch:
 			body, ok := readJSONBody(w, r)
 			if !ok {
@@ -962,12 +1042,23 @@ func restIssues(w http.ResponseWriter, r *http.Request, store *Store, owner, nam
 	writeErr(w, http.StatusNotFound, "Not Found")
 }
 
+// issueBodyPool reuses the read buffer for POST /issues bodies. The pooled
+// bytes never escape restIssueCreate: the scanner copies title/body into
+// strings, the renderer copies them into fresh wire bytes, the slow path's
+// json.Unmarshal copies every string it keeps, and the buffer is returned
+// to the pool only after all of that (defer). Do not retain data or any
+// slice of it past the create call.
+var issueBodyPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
 func restIssueCreate(w http.ResponseWriter, r *http.Request, store *Store, repo *Repo) {
-	data, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	if err != nil {
+	buf := issueBodyPool.Get().(*bytes.Buffer)
+	defer issueBodyPool.Put(buf)
+	buf.Reset()
+	if _, err := buf.ReadFrom(io.LimitReader(r.Body, 1<<20)); err != nil {
 		writeErr(w, http.StatusBadRequest, "Bad Request")
 		return
 	}
+	data := buf.Bytes()
 	// Fast path: flat object, string title/body, no labels (or an empty/null
 	// labels array) — the shape the write workload sends. Anything unusual
 	// falls through to the full decoder below, which stays authoritative.

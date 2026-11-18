@@ -20,7 +20,6 @@ package main
 import (
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -29,13 +28,9 @@ import (
 func main() {
 	store := NewStore()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Header().Set("Content-Length", "12")
-		_, _ = w.Write([]byte("{\"ok\":true}\n"))
-	})
-	registerRoutes(mux, store)
+	// Hand-rolled prefix dispatcher (routes.go) instead of http.ServeMux:
+	// the mux's matchPath + unescape cost ~30% of the issue hot paths.
+	handler := newDispatchHandler(store)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -51,7 +46,7 @@ func main() {
 	// Wired in round 2 after the A/B numbers (rawbench + runner 120/120)
 	// showed a clear win; see ~/workspace/makefun/git-forge-bench/.
 	go func() {
-		_ = serveTransport(ln, mux)
+		_ = serveTransport(ln, handler)
 	}()
 
 	// Serve until killed; the parent kills us once the suite says done.

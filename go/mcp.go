@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 )
 
@@ -61,7 +60,8 @@ func writeRPC(w http.ResponseWriter, status int, id json.RawMessage, result any,
 	buf.WriteString("}")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("X-GitHub-Request-Id", requestID())
-	w.Header().Set("Content-Length", strconv.Itoa(len(buf.Bytes())))
+	// No Content-Length: transport.go frames the response with an exact one
+	// and drops any handler-set value.
 	w.WriteHeader(status)
 	_, _ = w.Write(buf.Bytes())
 }
